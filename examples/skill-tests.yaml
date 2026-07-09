@@ -1,0 +1,17 @@
+settings:
+  runs_per_prompt: 10
+  pass_threshold: 0.8
+  fail_threshold: 0.2
+  model: claude-sonnet-4-6
+
+skills_dir: ./
+
+tests:
+  - skill: recipe-scaler
+    positive:
+      - "scale this lasagna recipe up to 12 people"
+      - "I'm cooking for 3 instead of 6, adjust the amounts"
+      - "convert this recipe from 4 servings to 10"
+    negative:
+      - "what's a good lasagna recipe?"
+      - "how do I scale a web service to 12 nodes?"

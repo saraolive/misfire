@@ -1,0 +1,17 @@
+[project]
+name = "misfire"
+version = "0.1.0"
+description = "Trigger testing for Claude skills — a skill that never fires is just a well-formatted file."
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31", "pyyaml>=6.0"]
+license = {text = "MIT"}
+
+[project.urls]
+Homepage = "https://github.com/saraolive/misfire"
+
+[project.scripts]
+misfire = "misfire:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
