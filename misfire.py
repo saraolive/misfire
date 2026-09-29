@@ -37,6 +37,17 @@ RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
 # is flagged as a regression, even if it still clears the pass threshold.
 REGRESSION_TOLERANCE = 0.2
 
+# In overlap mode, a neighbour that wins at least this share of a skill's
+# trials is reported as contesting that skill.
+OVERLAP_THRESHOLD = 0.2
+
+# Directories never descended into when looking for SKILL.md files.
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+
+# Where `corpus`, `overlap` and `suggest` look when no directory is given.
+DEFAULT_SKILL_DIRS = [Path("./.claude/skills"), Path("./skills"),
+                      Path.home() / ".claude" / "skills"]
+
 _sleep = time.sleep  # swapped out in tests
 
 JUDGE_PROMPT = """You are simulating skill selection for an AI agent.
@@ -60,24 +71,60 @@ Respond with ONLY a JSON object, no other text:
 
 # ---------------------------------------------------------------- catalog
 
-def load_catalog(skills_dir: Path) -> dict[str, str]:
-    """Map skill name -> description from every SKILL.md under skills_dir."""
+def find_skill_files(root: Path) -> list[Path]:
+    """Every SKILL.md under root, recursively, skipping vendored/build dirs.
+
+    Plugins nest skills (plugin/skills/name/SKILL.md) and personal skills live
+    in ~/.claude/skills, so a flat one-level glob misses most real layouts.
+    """
+    found: list[Path] = []
+    for p in sorted(root.rglob("SKILL.md")):
+        rel_parts = p.relative_to(root).parts[:-1]
+        if any(part in SKIP_DIRS for part in rel_parts):
+            continue
+        found.append(p)
+    return found
+
+
+def default_skill_dirs() -> list[Path]:
+    dirs = [d for d in DEFAULT_SKILL_DIRS if d.is_dir()]
+    if not dirs:
+        looked = ", ".join(str(d) for d in DEFAULT_SKILL_DIRS)
+        sys.exit(f"misfire: no skills directory given and none of these exist: {looked}")
+    return dirs
+
+
+def load_catalog(skills_dirs: Path | list[Path]) -> dict[str, str]:
+    """Map skill name -> description from every SKILL.md under the given dir(s).
+
+    Duplicate names keep the first one found and warn on stderr.
+    """
+    dirs = [skills_dirs] if isinstance(skills_dirs, Path) else list(skills_dirs)
     catalog: dict[str, str] = {}
-    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
-        text = skill_md.read_text(encoding="utf-8")
-        m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
-        if not m:
-            continue
-        try:
-            meta = yaml.safe_load(m.group(1)) or {}
-        except yaml.YAMLError:
-            continue
-        name = meta.get("name") or skill_md.parent.name
-        desc = (meta.get("description") or "").strip()
-        if desc:
-            catalog[str(name)] = desc
+    origin: dict[str, Path] = {}
+    for d in dirs:
+        for skill_md in find_skill_files(d):
+            text = skill_md.read_text(encoding="utf-8")
+            m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+            if not m:
+                continue
+            try:
+                meta = yaml.safe_load(m.group(1)) or {}
+            except yaml.YAMLError:
+                continue
+            name = str(meta.get("name") or skill_md.parent.name)
+            desc = (meta.get("description") or "").strip()
+            if not desc:
+                continue
+            if name in catalog:
+                print(f"⚠ duplicate skill name '{name}': {skill_md} "
+                      f"(keeping {origin[name]})", file=sys.stderr)
+                continue
+            catalog[name] = desc
+            origin[name] = skill_md
     if not catalog:
-        sys.exit(f"misfire: no skills with descriptions found in {skills_dir}")
+        where = ", ".join(str(d) for d in dirs)
+        sys.exit(f"misfire: no skills with descriptions found in {where}")
     return catalog
 
 
@@ -342,8 +389,8 @@ def extract_trigger_examples(description: str) -> list[str]:
     return [q.strip() for q in quoted if " " in q][:6]
 
 
-def run_corpus(skills_dir: Path, runs: int, model: str) -> int:
-    catalog = load_catalog(skills_dir)
+def run_corpus(skills_dirs: list[Path], runs: int, model: str) -> int:
+    catalog = load_catalog(skills_dirs)
     print(f"\nmisfire corpus · {len(catalog)} skills · testing each against "
           f"its own description's trigger examples\n")
     results: list[TestResult] = []
@@ -361,12 +408,127 @@ def run_corpus(skills_dir: Path, runs: int, model: str) -> int:
     return 1 if any(not r.passed for r in results) else 0
 
 
+# ---------------------------------------------------------------- overlap mode
+
+@dataclass
+class OverlapRow:
+    skill: str
+    prompts: int
+    trials: int
+    own: int                                   # trials where the skill itself fired
+    others: dict[str, int] = field(default_factory=dict)   # neighbour -> trials won
+    none: int = 0                              # trials where nothing fired
+    contested: list[dict] = field(default_factory=list)    # per-prompt thefts
+
+    @property
+    def own_rate(self) -> float:
+        return self.own / self.trials if self.trials else 0.0
+
+
+def build_overlap(results: list[TestResult], threshold: float = OVERLAP_THRESHOLD
+                  ) -> tuple[list[OverlapRow], list[dict]]:
+    """Aggregate per-skill results into who-wins-what rows and contested pairs."""
+    rows: dict[str, OverlapRow] = {}
+    for r in results:
+        row = rows.setdefault(r.skill, OverlapRow(r.skill, 0, 0, 0))
+        own = int(round(r.trigger_rate * r.runs))
+        stolen = sum(r.stolen_by.values())
+        row.prompts += 1
+        row.trials += r.runs
+        row.own += own
+        row.none += r.runs - own - stolen
+        for thief, n in r.stolen_by.items():
+            row.others[thief] = row.others.get(thief, 0) + n
+            row.contested.append({"prompt": r.prompt, "thief": thief, "count": n,
+                                  "runs": r.runs})
+    pairs: list[dict] = []
+    for row in rows.values():
+        for thief, n in sorted(row.others.items(), key=lambda kv: -kv[1]):
+            share = n / row.trials
+            if share >= threshold - 1e-9:
+                pairs.append({
+                    "skill": row.skill, "thief": thief, "count": n,
+                    "trials": row.trials, "share": share,
+                    "prompts": [c for c in row.contested if c["thief"] == thief],
+                })
+    pairs.sort(key=lambda p: -p["share"])
+    return list(rows.values()), pairs
+
+
+def report_overlap(rows: list[OverlapRow], pairs: list[dict], runs: int,
+                   threshold: float, skipped: list[str]) -> None:
+    total_prompts = sum(r.prompts for r in rows)
+    print(f"\nmisfire overlap · {len(rows)} skills · {total_prompts} prompts · "
+          f"{runs} runs each\n")
+    width = max((len(r.skill) for r in rows), default=10)
+    print(f"  {'skill':<{width}}  {'own':>7}   lost to")
+    for row in sorted(rows, key=lambda r: r.own_rate):
+        lost = "  ".join(f"{t} {n}" for t, n in
+                         sorted(row.others.items(), key=lambda kv: -kv[1]))
+        if row.none:
+            lost += f"{'  ' if lost else ''}(none) {row.none}"
+        print(f"  {row.skill:<{width}}  {row.own:>3}/{row.trials:<3}   {lost or '—'}")
+    if skipped:
+        print(f"\n  ∅ no quoted trigger examples, not tested: {', '.join(skipped)}")
+    if pairs:
+        print(f"\n  contested (a neighbour took ≥ {threshold:.0%} of a skill's trials):")
+        for p in pairs:
+            print(f"    {p['skill']} ← {p['thief']}  {p['count']}/{p['trials']}")
+            for c in p["prompts"]:
+                print(f"      {c['prompt'][:60]!r:<64} ×{c['count']}/{c['runs']}")
+    else:
+        print(f"\n  no contested pairs at ≥ {threshold:.0%}")
+    print()
+
+
+def collect_overlap_prompts(catalog: dict[str, str], spec_path: Path | None
+                            ) -> tuple[dict[str, list[str]], list[str]]:
+    """Prompts per skill: quoted description examples plus spec positives."""
+    prompts: dict[str, list[str]] = {}
+    for skill, desc in catalog.items():
+        prompts[skill] = extract_trigger_examples(desc)
+    if spec_path:
+        spec = yaml.safe_load(spec_path.read_text(encoding="utf-8")) or {}
+        for t in spec.get("tests", []):
+            skill = t.get("skill")
+            if skill in prompts:
+                for p in t.get("positive", []):
+                    if p not in prompts[skill]:
+                        prompts[skill].append(p)
+            else:
+                print(f"⚠ spec skill not in catalog, ignored: {skill}", file=sys.stderr)
+    skipped = [s for s, ps in prompts.items() if not ps]
+    return {s: ps for s, ps in prompts.items() if ps}, skipped
+
+
+def run_overlap(skills_dirs: list[Path], runs: int, model: str, threshold: float,
+                spec_path: Path | None, as_json: bool) -> int:
+    catalog = load_catalog(skills_dirs)
+    prompts, skipped = collect_overlap_prompts(catalog, spec_path)
+    results: list[TestResult] = []
+    for skill, ps in prompts.items():
+        for p in ps:
+            results.append(run_prompt(catalog, skill, p, "positive",
+                                      runs, 0.0, 1.0, model))
+    rows, pairs = build_overlap(results, threshold)
+    if as_json:
+        print(json.dumps({
+            "model": model, "runs_per_prompt": runs, "threshold": threshold,
+            "skills": [r.__dict__ for r in rows],
+            "contested": pairs, "untested": skipped,
+        }, indent=2))
+    else:
+        report_overlap(rows, pairs, runs, threshold, skipped)
+    return 1 if pairs else 0
+
+
 # ---------------------------------------------------------------- suggest mode
 
-def run_suggest(skills_dir: Path, skill: str, model: str) -> int:
-    catalog = load_catalog(skills_dir)
+def run_suggest(skills_dirs: list[Path], skill: str, model: str) -> int:
+    catalog = load_catalog(skills_dirs)
     if skill not in catalog:
-        sys.exit(f"misfire: skill '{skill}' not found in {skills_dir}")
+        where = ", ".join(str(d) for d in skills_dirs)
+        sys.exit(f"misfire: skill '{skill}' not found in {where}")
     prompt = (
         "Given this skill description, write 5 realistic user prompts that SHOULD "
         "trigger it (varied phrasing, not copies of the description) and 3 adjacent "
@@ -402,16 +564,39 @@ def build_parser() -> argparse.ArgumentParser:
                        help="with --compare: exit 1 if any prompt's rate moved the wrong "
                             "way by 20%% or more, even if it still passes its threshold")
 
+    dirs_help = ("skills directory, searched recursively; defaults to every one of "
+                 "./.claude/skills, ./skills, ~/.claude/skills that exists")
+
     cor_p = sub.add_parser("corpus", help="auto-test every skill in a directory")
-    cor_p.add_argument("skills_dir", type=Path)
+    cor_p.add_argument("skills_dir", type=Path, nargs="?", default=None, help=dirs_help)
     cor_p.add_argument("--runs", type=int, default=5)
     cor_p.add_argument("--model", default=DEFAULT_MODEL)
 
+    ov_p = sub.add_parser("overlap",
+                          help="which skills steal each other's prompts across a library")
+    ov_p.add_argument("skills_dir", type=Path, nargs="?", default=None, help=dirs_help)
+    ov_p.add_argument("--spec", type=Path, default=None,
+                      help="also use positive prompts from this skill-tests.yaml")
+    ov_p.add_argument("--runs", type=int, default=5)
+    ov_p.add_argument("--model", default=DEFAULT_MODEL)
+    ov_p.add_argument("--threshold", type=float, default=OVERLAP_THRESHOLD,
+                      help="report a neighbour that wins at least this share of a "
+                           "skill's trials (default 0.2); exit 1 if any pair qualifies")
+    ov_p.add_argument("--json", action="store_true", help="machine-readable report")
+
     sug_p = sub.add_parser("suggest", help="generate candidate test prompts for a skill")
     sug_p.add_argument("skill")
-    sug_p.add_argument("--skills-dir", type=Path, default=Path("./skills"))
+    sug_p.add_argument("--skills-dir", type=Path, default=None, help=dirs_help)
     sug_p.add_argument("--model", default=DEFAULT_MODEL)
     return p
+
+
+def _dirs(given: Path | None) -> list[Path]:
+    if given is None:
+        return default_skill_dirs()
+    if not given.is_dir():
+        sys.exit(f"misfire: not a directory: {given}")
+    return [given]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -422,9 +607,12 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(run_suite(a.spec, a.runs, a.json, a.model,
                            a.save, a.compare, a.fail_on_regression))
     elif a.cmd == "corpus":
-        sys.exit(run_corpus(a.skills_dir, a.runs, a.model))
+        sys.exit(run_corpus(_dirs(a.skills_dir), a.runs, a.model))
+    elif a.cmd == "overlap":
+        sys.exit(run_overlap(_dirs(a.skills_dir), a.runs, a.model, a.threshold,
+                             a.spec, a.json))
     elif a.cmd == "suggest":
-        sys.exit(run_suggest(a.skills_dir, a.skill, a.model))
+        sys.exit(run_suggest(_dirs(a.skills_dir), a.skill, a.model))
 
 
 if __name__ == "__main__":
