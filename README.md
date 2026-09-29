@@ -31,9 +31,13 @@ Linters (skill-lint, claudelint, agnix) solve structure. misfire solves behavior
 ## Install
 
 ```bash
-pip install misfire        # or: copy misfire.py — it's one file, stdlib + requests + pyyaml
+pipx install git+https://github.com/saraolive/misfire     # or: pip install git+https://...
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+Either line gives you a `misfire` command. Pin a release with `...misfire@v0.2.0`.
+
+Or skip installing entirely: `misfire.py` is one file, stdlib + `requests` + `pyyaml`. Copy it into your repo and run `python misfire.py`.
 
 ## Test spec
 
@@ -76,6 +80,9 @@ Testing against the *whole catalog* matters: skills don't misfire in isolation, 
 ```bash
 misfire run skill-tests.yaml              # run the suite, exit 1 on failure
 misfire run skill-tests.yaml --json       # machine-readable report
+misfire run skill-tests.yaml --runs 3     # quick local check; --model to override the judge
+misfire run skill-tests.yaml --save baseline.json       # record trigger rates
+misfire run skill-tests.yaml --compare baseline.json    # show deltas vs. that record
 misfire corpus ./skills                   # no spec needed: auto-tests every skill
                                           #   against its own description's trigger examples
 misfire suggest risk-sweep                # generates candidate positive/negative
@@ -84,22 +91,58 @@ misfire suggest risk-sweep                # generates candidate positive/negativ
 
 `corpus` mode is how you audit a skill library you didn't write: point it at any skills directory and get a trigger-rate scorecard with zero setup.
 
+## Baseline & diff
+
+Thresholds catch a skill that *broke*. They don't catch one that *slipped*: a positive prompt going from 10/10 to 8/10 still passes at 0.8, and the next description edit takes it to 6/10. `--save` and `--compare` make the slip visible.
+
+```
+$ misfire run skill-tests.yaml --save baseline.json      # on main, once
+$ # ...edit a description...
+$ misfire run skill-tests.yaml --compare baseline.json
+
+  risk-sweep
+    ✓ positive  "what's at risk this week?"          8/10 triggered  was 10/10  Δ -0.20  ↓ REGRESSED
+    ✓ positive  "run a risk sweep"                  10/10 triggered  was 10/10  Δ 0.00
+    ✓ negative  "explain risk management"            0/10 triggered  was 1/10   Δ -0.10
+    ✓ positive  "what's blocking us right now?"      9/10 triggered  (new)
+
+  1 skills · 4 tests · 0 failures · 1 regression
+```
+
+- Results are matched on skill + prompt + kind, so reordering or adding tests is fine; new prompts show as `(new)`.
+- A **regression** is a move of 0.2 or more in the wrong direction: positives firing less, negatives firing more. It's reported but doesn't fail the run unless you pass `--fail-on-regression`.
+- The baseline file is the same JSON as `--json`, so you can `--save` and `--json` from one run, or commit the baseline next to your spec.
+- Keep `runs_per_prompt` the same between baseline and compare, otherwise the deltas are noise.
+
 ## CI
 
 ```yaml
 # .github/workflows/misfire.yml
-- run: pip install misfire
-- run: misfire run skill-tests.yaml --json > misfire-report.json
+- run: pip install git+https://github.com/saraolive/misfire
+- run: misfire run skill-tests.yaml --compare misfire-baseline.json --fail-on-regression
   env:
     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
 Gate PRs on trigger accuracy the way you gate them on unit tests. Description edits that would silently break triggering now fail loudly in review.
 
+Commit `misfire-baseline.json` alongside your spec and refresh it on `main` with `--save` whenever you intentionally change a description. Note that forked PRs can't read repository secrets, so on public repos this check only runs for branches in the main repo.
+
 ## Cost & honesty notes
 
 - Each test = `runs_per_prompt` small API calls. A 10-skill suite at 10 runs ≈ a few hundred cheap calls. Use `--runs 3` for quick local iteration, full runs in CI.
+- Rate limits and transient errors are retried with exponential backoff (up to 5 retries, honouring `Retry-After`). Persistent failures abort the run rather than silently counting as "didn't trigger".
 - misfire measures a **proxy**: the trigger decision given the catalog, not a full agent session. It correlates strongly with real behavior but simple one-step prompts may under-trigger in real sessions regardless of description quality (models skip skills for tasks they can handle directly). Write substantive test prompts.
+
+## Development
+
+```bash
+git clone https://github.com/saraolive/misfire && cd misfire
+pip install -e ".[dev]"
+pytest                      # no API key needed; every network call is mocked
+```
+
+Bug reports and PRs welcome at [github.com/saraolive/misfire/issues](https://github.com/saraolive/misfire/issues).
 
 ## License
 
