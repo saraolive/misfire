@@ -85,11 +85,44 @@ misfire run skill-tests.yaml --save baseline.json       # record trigger rates
 misfire run skill-tests.yaml --compare baseline.json    # show deltas vs. that record
 misfire corpus ./skills                   # no spec needed: auto-tests every skill
                                           #   against its own description's trigger examples
+misfire overlap ./skills                  # which skills steal each other's prompts
 misfire suggest risk-sweep                # generates candidate positive/negative
                                           #   prompts for a skill, to seed your spec
 ```
 
 `corpus` mode is how you audit a skill library you didn't write: point it at any skills directory and get a trigger-rate scorecard with zero setup.
+
+Skill directories are searched **recursively**, so a plugin repo with `plugins/*/skills/*/SKILL.md` works as-is. `corpus`, `overlap` and `suggest` with no directory argument look in `./.claude/skills`, `./skills` and `~/.claude/skills`, and combine every one that exists. That's the catalog Claude actually sees, so it's the one worth testing.
+
+## Overlap report
+
+A skill rarely misfires alone. It misfires because a neighbour's description is pushier, or because two skills describe the same territory. `overlap` runs every skill's trigger examples against the whole catalog and shows who wins.
+
+```
+$ misfire overlap ~/.claude/skills --runs 5
+
+misfire overlap · 6 skills · 23 prompts · 5 runs each
+
+  skill                 own   lost to
+  standup-prep         9/20    risk-sweep 8  (none) 3
+  stakeholder-update  14/20    sync-all 4  (none) 2
+  risk-sweep          18/20    (none) 2
+  project-sync        15/15    —
+
+  ∅ no quoted trigger examples, not tested: memory-create
+
+  contested (a neighbour took ≥ 20% of a skill's trials):
+    standup-prep ← risk-sweep  8/20
+      'what should I be worried about today'   ×5/5
+      'who do I need to check in with'         ×3/5
+    stakeholder-update ← sync-all  4/20
+      'pull the latest before I write the update'   ×4/5
+```
+
+- Prompts come from the quoted phrases in each skill's description. Add `--spec skill-tests.yaml` to include your positive prompts too.
+- A **contested pair** is a neighbour winning at least 20% of a skill's trials, adjustable with `--threshold`. Any contested pair exits 1, so this can gate a plugin repo the same way `run` gates a spec.
+- `(none)` counts trials where no skill fired at all. A high `(none)` with no thief means the description is too weak, not that a neighbour is too strong. It can also mean the quoted phrases in the description aren't user prompts at all (command names, file types), in which case use `--spec` to supply real ones.
+- `--json` emits the rows, the contested pairs with their offending prompts, and the list of untested skills.
 
 ## Baseline & diff
 
