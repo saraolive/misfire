@@ -3,14 +3,19 @@ on: [pull_request]
 jobs:
   trigger-tests:
     runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install requests pyyaml
-      - run: python misfire.py run examples/skill-tests.yaml --json > misfire-report.json
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Skip when no API key is available
+        if: env.ANTHROPIC_API_KEY == ''
+        run: echo "::notice::ANTHROPIC_API_KEY secret not set (or this is a forked PR); skipping trigger tests."
+      - name: Run trigger tests
+        if: env.ANTHROPIC_API_KEY != ''
+        run: python misfire.py run examples/skill-tests.yaml --json > misfire-report.json
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: env.ANTHROPIC_API_KEY != ''
         with: { name: misfire-report, path: misfire-report.json }
