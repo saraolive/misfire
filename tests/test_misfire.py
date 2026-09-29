@@ -88,6 +88,39 @@ def test_load_catalog_exits_when_empty(tmp_path: Path):
         misfire.load_catalog(tmp_path)
 
 
+def test_find_skill_files_is_recursive_and_skips_vendored_dirs(tmp_path: Path):
+    write_skill(tmp_path, "top", "a")
+    write_skill(tmp_path, "plugin/skills/nested", "b")
+    write_skill(tmp_path, "deep/er/still", "c")
+    write_skill(tmp_path, "node_modules/pkg/skills/x", "d")
+    write_skill(tmp_path, ".git/hooks/y", "e")
+    write_skill(tmp_path, "sub/.venv/lib/z", "f")
+    found = [p.relative_to(tmp_path).as_posix() for p in misfire.find_skill_files(tmp_path)]
+    assert found == ["deep/er/still/SKILL.md", "plugin/skills/nested/SKILL.md",
+                     "top/SKILL.md"]
+
+
+def test_load_catalog_finds_nested_skills(tmp_path: Path):
+    write_skill(tmp_path, "plugin/skills/nested", "Nested one.")
+    write_skill(tmp_path, "flat", "Flat one.")
+    assert misfire.load_catalog(tmp_path) == {"flat": "Flat one.", "nested": "Nested one."}
+
+
+def test_load_catalog_merges_multiple_dirs(tmp_path: Path):
+    write_skill(tmp_path / "one", "a", "A.")
+    write_skill(tmp_path / "two", "b", "B.")
+    cat = misfire.load_catalog([tmp_path / "one", tmp_path / "two"])
+    assert cat == {"a": "A.", "b": "B."}
+
+
+def test_load_catalog_warns_on_duplicate_name_and_keeps_first(tmp_path: Path, capsys):
+    write_skill(tmp_path / "one", "dup", "First.")
+    write_skill(tmp_path / "two", "dup", "Second.")
+    cat = misfire.load_catalog([tmp_path / "one", tmp_path / "two"])
+    assert cat == {"dup": "First."}
+    assert "duplicate skill name 'dup'" in capsys.readouterr().err
+
+
 def test_render_catalog_format():
     out = misfire.render_catalog({"a": "desc a", "b": "desc b"})
     assert out == "### a\ndesc a\n\n### b\ndesc b"
@@ -422,6 +455,102 @@ def test_run_suite_json_includes_regression_count(tmp_path, skills, capsys):
     assert pos["baseline_rate"] == 1.0 and pos["trigger_rate"] == 0.0
 
 
+# ---------------------------------------------------------------- overlap
+
+def TR(skill, prompt, rate, runs=5, stolen=None):
+    return misfire.TestResult(skill, prompt, "positive", rate, runs, True, stolen or {})
+
+
+def test_build_overlap_aggregates_rows_and_pairs():
+    results = [
+        TR("a", "a1", 1.0),
+        TR("a", "a2", 0.4, stolen={"b": 2, "c": 1}),      # 2 own, 2 b, 1 c
+        TR("b", "b1", 0.8, stolen={"a": 1}),
+        TR("b", "b2", 0.6),                                # 3 own, 2 none
+    ]
+    rows, pairs = misfire.build_overlap(results, threshold=0.2)
+    by = {r.skill: r for r in rows}
+    assert by["a"].prompts == 2 and by["a"].trials == 10
+    assert by["a"].own == 7 and by["a"].others == {"b": 2, "c": 1} and by["a"].none == 0
+    assert by["a"].own_rate == pytest.approx(0.7)
+    assert by["b"].own == 7 and by["b"].others == {"a": 1} and by["b"].none == 2
+    # only a<-b clears 20%: 2/10. a<-c is 1/10, b<-a is 1/10.
+    assert [(p["skill"], p["thief"], p["count"], p["trials"]) for p in pairs] == \
+        [("a", "b", 2, 10)]
+    assert pairs[0]["share"] == pytest.approx(0.2)
+    assert pairs[0]["prompts"] == [{"prompt": "a2", "thief": "b", "count": 2, "runs": 5}]
+
+
+def test_build_overlap_pairs_sorted_by_share():
+    results = [TR("a", "a1", 0.0, stolen={"b": 5}),
+               TR("b", "b1", 0.4, stolen={"a": 3})]
+    _, pairs = misfire.build_overlap(results, threshold=0.2)
+    assert [(p["skill"], p["thief"]) for p in pairs] == [("a", "b"), ("b", "a")]
+
+
+def test_collect_overlap_prompts_merges_spec_positives(skills, tmp_path, capsys):
+    spec = tmp_path / "s.yaml"
+    spec.write_text("""
+tests:
+  - skill: risk-sweep
+    positive: ["what is at risk", "extra risk prompt"]
+    negative: ["ignored negative"]
+  - skill: ghost
+    positive: ["never"]
+""")
+    cat = misfire.load_catalog(skills)
+    prompts, skipped = misfire.collect_overlap_prompts(cat, spec)
+    assert prompts["risk-sweep"] == ["what is at risk", "risk sweep", "extra risk prompt"]
+    assert prompts["recipe-scaler"] == ["scale this recipe", "adjust for N people"]
+    assert skipped == []
+    assert "spec skill not in catalog, ignored: ghost" in capsys.readouterr().err
+
+
+def test_collect_overlap_prompts_reports_untested(tmp_path):
+    write_skill(tmp_path, "quiet", "No examples.")
+    write_skill(tmp_path, "loud", 'Say "hello there friend".')
+    prompts, skipped = misfire.collect_overlap_prompts(misfire.load_catalog(tmp_path), None)
+    assert list(prompts) == ["loud"] and skipped == ["quiet"]
+
+
+def test_run_overlap_text_report_and_exit_code(skills, capsys):
+    # risk-sweep steals every recipe prompt; risk prompts are clean.
+    with mock.patch("misfire.judge_once", constant_judge({"risk": "risk-sweep",
+                                                          "recipe": "risk-sweep",
+                                                          "people": "risk-sweep"})):
+        code = misfire.run_overlap([skills], 3, "m", 0.2, None, as_json=False)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "misfire overlap · 2 skills · 4 prompts · 3 runs each" in out
+    assert "recipe-scaler    0/6     risk-sweep 6" in out
+    assert "risk-sweep       6/6     —" in out
+    assert "recipe-scaler ← risk-sweep  6/6" in out
+    assert "'scale this recipe'" in out and "×3/3" in out
+
+
+def test_run_overlap_clean_library_exits_zero(skills, capsys):
+    with mock.patch("misfire.judge_once", constant_judge({"risk": "risk-sweep",
+                                                          "recipe": "recipe-scaler",
+                                                          "people": "recipe-scaler"})):
+        code = misfire.run_overlap([skills], 2, "m", 0.2, None, as_json=False)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "no contested pairs at ≥ 20%" in out
+
+
+def test_run_overlap_json(skills, capsys):
+    with mock.patch("misfire.judge_once", constant_judge({"risk": "recipe-scaler"})):
+        code = misfire.run_overlap([skills], 2, "m", 0.5, None, as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert data["threshold"] == 0.5 and data["runs_per_prompt"] == 2
+    assert {s["skill"] for s in data["skills"]} == {"recipe-scaler", "risk-sweep"}
+    rs = next(s for s in data["skills"] if s["skill"] == "risk-sweep")
+    assert rs["own"] == 0 and rs["others"] == {"recipe-scaler": 4}
+    assert data["contested"][0]["skill"] == "risk-sweep"
+    assert data["untested"] == []
+
+
 # ---------------------------------------------------------------- corpus / suggest
 
 def test_run_corpus_uses_description_examples(skills, capsys):
@@ -450,7 +579,7 @@ def test_run_suggest_prints_model_reply(skills, capsys):
 
 def test_run_suggest_unknown_skill_exits(skills):
     with pytest.raises(SystemExit):
-        misfire.run_suggest(skills, "nope", "m")
+        misfire.run_suggest([skills], "nope", "m")
 
 
 # ---------------------------------------------------------------- cli
@@ -472,12 +601,41 @@ def test_cli_fail_on_regression_requires_compare():
     assert "requires --compare" in str(e.value)
 
 
-def test_cli_corpus_and_suggest_dispatch():
+def test_cli_corpus_overlap_suggest_dispatch(skills):
+    d = str(skills)
     with mock.patch("misfire.run_corpus", return_value=0) as rc:
         with pytest.raises(SystemExit):
-            misfire.main(["corpus", "./skills", "--runs", "2"])
-    rc.assert_called_once_with(Path("./skills"), 2, misfire.DEFAULT_MODEL)
+            misfire.main(["corpus", d, "--runs", "2"])
+    rc.assert_called_once_with([skills], 2, misfire.DEFAULT_MODEL)
+    with mock.patch("misfire.run_overlap", return_value=0) as ro:
+        with pytest.raises(SystemExit):
+            misfire.main(["overlap", d, "--runs", "4", "--threshold", "0.3",
+                          "--spec", "s.yaml", "--json"])
+    ro.assert_called_once_with([skills], 4, misfire.DEFAULT_MODEL, 0.3,
+                               Path("s.yaml"), True)
     with mock.patch("misfire.run_suggest", return_value=0) as rsg:
         with pytest.raises(SystemExit):
-            misfire.main(["suggest", "risk-sweep", "--skills-dir", "s"])
-    rsg.assert_called_once_with(Path("s"), "risk-sweep", misfire.DEFAULT_MODEL)
+            misfire.main(["suggest", "risk-sweep", "--skills-dir", d])
+    rsg.assert_called_once_with([skills], "risk-sweep", misfire.DEFAULT_MODEL)
+
+
+def test_cli_rejects_missing_directory(tmp_path):
+    with pytest.raises(SystemExit) as e:
+        misfire.main(["corpus", str(tmp_path / "nope")])
+    assert "not a directory" in str(e.value)
+
+
+def test_cli_uses_default_dirs_when_none_given(monkeypatch, tmp_path):
+    monkeypatch.setattr(misfire, "DEFAULT_SKILL_DIRS", [tmp_path / "a", tmp_path / "b"])
+    (tmp_path / "b").mkdir()
+    with mock.patch("misfire.run_corpus", return_value=0) as rc:
+        with pytest.raises(SystemExit):
+            misfire.main(["corpus"])
+    rc.assert_called_once_with([tmp_path / "b"], 5, misfire.DEFAULT_MODEL)
+
+
+def test_default_skill_dirs_exits_when_none_exist(monkeypatch, tmp_path):
+    monkeypatch.setattr(misfire, "DEFAULT_SKILL_DIRS", [tmp_path / "missing"])
+    with pytest.raises(SystemExit) as e:
+        misfire.default_skill_dirs()
+    assert "none of these exist" in str(e.value)
