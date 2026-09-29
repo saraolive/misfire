@@ -10,8 +10,10 @@ import argparse
 import concurrent.futures as cf
 import json
 import os
+import random
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +25,19 @@ except ImportError:
 
 API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+# Retry policy for the API. 429 and 5xx are retried with exponential backoff;
+# a Retry-After header, when present, wins over the computed delay.
+MAX_RETRIES = 5
+BACKOFF_BASE = 1.0      # seconds; doubles each attempt
+BACKOFF_CAP = 30.0
+RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
+
+# A prompt whose trigger rate drops by at least this much versus the baseline
+# is flagged as a regression, even if it still clears the pass threshold.
+REGRESSION_TOLERANCE = 0.2
+
+_sleep = time.sleep  # swapped out in tests
 
 JUDGE_PROMPT = """You are simulating skill selection for an AI agent.
 
@@ -79,28 +94,63 @@ def api_key() -> str:
     return key
 
 
+class APIError(RuntimeError):
+    """Raised when the API keeps failing after all retries."""
+
+
+def _retry_delay(attempt: int, resp: requests.Response | None) -> float:
+    if resp is not None:
+        ra = resp.headers.get("retry-after")
+        if ra:
+            try:
+                return min(float(ra), BACKOFF_CAP)
+            except ValueError:
+                pass
+    delay = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_CAP)
+    return delay * (0.5 + random.random())  # jitter: 0.5x .. 1.5x
+
+
+def post_messages(payload: dict, max_retries: int = MAX_RETRIES) -> str:
+    """POST to the Messages API and return the concatenated text of the reply.
+
+    Retries on rate limits (429), overload (529), server errors (5xx), and
+    connection/timeout failures. Anything else raises immediately.
+    """
+    headers = {
+        "x-api-key": api_key(),
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    last_err: str = ""
+    for attempt in range(max_retries + 1):
+        resp = None
+        try:
+            resp = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_err = f"{type(e).__name__}: {e}"
+        else:
+            if resp.status_code < 400:
+                body = resp.json()
+                return "".join(b.get("text", "") for b in body.get("content", []))
+            if resp.status_code not in RETRY_STATUSES:
+                resp.raise_for_status()
+            last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        if attempt < max_retries:
+            _sleep(_retry_delay(attempt, resp))
+    raise APIError(f"gave up after {max_retries + 1} attempts — {last_err}")
+
+
 def judge_once(catalog_str: str, prompt: str, model: str) -> str | None:
     """One trial: which skill (if any) would the agent consult?"""
-    resp = requests.post(
-        API_URL,
-        headers={
-            "x-api-key": api_key(),
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": model,
-            "max_tokens": 100,
-            "temperature": 1.0,  # triggering is stochastic; sample it honestly
-            "messages": [{
-                "role": "user",
-                "content": JUDGE_PROMPT.format(catalog=catalog_str, prompt=prompt),
-            }],
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    text = "".join(b.get("text", "") for b in resp.json().get("content", []))
+    text = post_messages({
+        "model": model,
+        "max_tokens": 100,
+        "temperature": 1.0,  # triggering is stochastic; sample it honestly
+        "messages": [{
+            "role": "user",
+            "content": JUDGE_PROMPT.format(catalog=catalog_str, prompt=prompt),
+        }],
+    })
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
         return None
@@ -122,6 +172,25 @@ class TestResult:
     runs: int
     passed: bool
     stolen_by: dict[str, int] = field(default_factory=dict)  # other skills that fired
+    baseline_rate: float | None = None  # set in --compare mode
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.skill, self.kind, self.prompt)
+
+    @property
+    def delta(self) -> float | None:
+        if self.baseline_rate is None:
+            return None
+        return self.trigger_rate - self.baseline_rate
+
+    @property
+    def regressed(self) -> bool:
+        """Positive prompts regress when they fire less; negatives when they fire more."""
+        d = self.delta
+        if d is None:
+            return False
+        return (-d if self.kind == "positive" else d) >= REGRESSION_TOLERANCE - 1e-9
 
 
 def run_prompt(catalog: dict[str, str], skill: str, prompt: str, kind: str,
@@ -142,39 +211,95 @@ def run_prompt(catalog: dict[str, str], skill: str, prompt: str, kind: str,
     return TestResult(skill, prompt, kind, rate, runs, passed, thieves)
 
 
-def run_suite(spec_path: Path, runs_override: int | None, as_json: bool) -> int:
+# ---------------------------------------------------------------- baselines
+
+def results_to_json(results: list[TestResult], model: str, runs: int) -> dict:
+    failures = sum(1 for r in results if not r.passed)
+    return {
+        "model": model,
+        "runs_per_prompt": runs,
+        "total": len(results),
+        "failures": failures,
+        "regressions": sum(1 for r in results if r.regressed),
+        "results": [r.__dict__ for r in results],
+    }
+
+
+def save_baseline(path: Path, results: list[TestResult], model: str, runs: int) -> None:
+    path.write_text(json.dumps(results_to_json(results, model, runs), indent=2) + "\n",
+                    encoding="utf-8")
+
+
+def load_baseline(path: Path) -> dict[tuple[str, str, str], float]:
+    """Map (skill, kind, prompt) -> trigger_rate from a saved report."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        (r["skill"], r["kind"], r["prompt"]): float(r["trigger_rate"])
+        for r in data.get("results", [])
+    }
+
+
+def apply_baseline(results: list[TestResult],
+                   baseline: dict[tuple[str, str, str], float]) -> None:
+    for r in results:
+        r.baseline_rate = baseline.get(r.key)
+
+
+# ---------------------------------------------------------------- suite
+
+def run_suite(spec_path: Path, runs_override: int | None, as_json: bool,
+              model_override: str | None = None,
+              save: Path | None = None, compare: Path | None = None,
+              fail_on_regression: bool = False) -> int:
     spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
     settings = spec.get("settings", {})
     runs = runs_override or int(settings.get("runs_per_prompt", 10))
     pass_thr = float(settings.get("pass_threshold", 0.8))
     fail_thr = float(settings.get("fail_threshold", 0.2))
-    model = settings.get("model", DEFAULT_MODEL)
+    model = model_override or settings.get("model", DEFAULT_MODEL)
     skills_dir = (spec_path.parent / spec.get("skills_dir", "./skills")).resolve()
     catalog = load_catalog(skills_dir)
+
+    baseline = load_baseline(compare) if compare else None
 
     results: list[TestResult] = []
     for t in spec.get("tests", []):
         skill = t["skill"]
         if skill not in catalog:
-            print(f"⚠ skipping unknown skill: {skill} (not in {skills_dir})")
+            print(f"⚠ skipping unknown skill: {skill} (not in {skills_dir})", file=sys.stderr)
             continue
         for kind in ("positive", "negative"):
             for prompt in t.get(kind, []):
                 results.append(run_prompt(catalog, skill, prompt, kind,
                                           runs, pass_thr, fail_thr, model))
 
+    if baseline is not None:
+        apply_baseline(results, baseline)
+    if save:
+        save_baseline(save, results, model, runs)
+
     failures = [r for r in results if not r.passed]
+    regressions = [r for r in results if r.regressed]
     if as_json:
-        print(json.dumps({
-            "total": len(results), "failures": len(failures),
-            "results": [r.__dict__ for r in results],
-        }, indent=2))
+        print(json.dumps(results_to_json(results, model, runs), indent=2))
     else:
-        report(results, pass_thr, fail_thr)
-    return 1 if failures else 0
+        report(results, pass_thr, fail_thr, compared=baseline is not None)
+        if save:
+            print(f"  baseline saved to {save}\n")
+
+    if failures:
+        return 1
+    if fail_on_regression and regressions:
+        return 1
+    return 0
 
 
-def report(results: list[TestResult], pass_thr: float, fail_thr: float) -> None:
+def _fmt_hits(rate: float, runs: int) -> str:
+    return f"{int(round(rate * runs))}/{runs}"
+
+
+def report(results: list[TestResult], pass_thr: float, fail_thr: float,
+           compared: bool = False) -> None:
     by_skill: dict[str, list[TestResult]] = {}
     for r in results:
         by_skill.setdefault(r.skill, []).append(r)
@@ -182,24 +307,38 @@ def report(results: list[TestResult], pass_thr: float, fail_thr: float) -> None:
         print(f"\n  {skill}")
         for r in rs:
             mark = "✓" if r.passed else "✗"
+            line = (f"    {mark} {r.kind:<8} {r.prompt[:48]!r:<52} "
+                    f"{_fmt_hits(r.trigger_rate, r.runs)} triggered")
+            if compared:
+                if r.baseline_rate is None:
+                    line += "  (new)"
+                else:
+                    d = r.delta or 0.0
+                    sign = "+" if d > 0 else ""
+                    line += f"  was {_fmt_hits(r.baseline_rate, r.runs)}  Δ {sign}{d:.2f}"
             tag = ""
             if not r.passed:
                 tag = "  ← MISFIRE" if r.kind == "negative" else "  ← UNDERTRIGGERS"
                 if r.stolen_by:
                     top = max(r.stolen_by, key=r.stolen_by.get)  # type: ignore[arg-type]
                     tag += f" (lost to: {top} ×{r.stolen_by[top]})"
-            print(f"    {mark} {r.kind:<8} {r.prompt[:48]!r:<52} "
-                  f"{int(r.trigger_rate * r.runs)}/{r.runs} triggered{tag}")
+            elif r.regressed:
+                tag = "  ↓ REGRESSED"
+            print(line + tag)
     fails = sum(1 for r in results if not r.passed)
-    print(f"\n  {len(by_skill)} skills · {len(results)} tests · "
-          f"{fails} failure{'s' if fails != 1 else ''}\n")
+    summary = (f"\n  {len(by_skill)} skills · {len(results)} tests · "
+               f"{fails} failure{'s' if fails != 1 else ''}")
+    if compared:
+        regs = sum(1 for r in results if r.regressed)
+        summary += f" · {regs} regression{'s' if regs != 1 else ''}"
+    print(summary + "\n")
 
 
 # ---------------------------------------------------------------- corpus mode
 
 def extract_trigger_examples(description: str) -> list[str]:
     """Pull quoted trigger phrases out of a skill's own description."""
-    quoted = re.findall(r'[\"\u201c\u2018\']([^\"\u201d\u2019\']{6,90})[\"\u201d\u2019\']', description)
+    quoted = re.findall(r'[\"“‘\']([^\"”’\']{6,90})[\"”’\']', description)
     return [q.strip() for q in quoted if " " in q][:6]
 
 
@@ -235,22 +374,16 @@ def run_suggest(skills_dir: Path, skill: str, model: str) -> int:
         "Respond as YAML with keys positive: and negative:.\n\n"
         f"Skill: {skill}\nDescription:\n{catalog[skill]}"
     )
-    resp = requests.post(
-        API_URL,
-        headers={"x-api-key": api_key(), "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"},
-        json={"model": model, "max_tokens": 800,
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    print("".join(b.get("text", "") for b in resp.json().get("content", [])))
+    print(post_messages({
+        "model": model, "max_tokens": 800,
+        "messages": [{"role": "user", "content": prompt}],
+    }))
     return 0
 
 
 # ---------------------------------------------------------------- cli
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="misfire",
                                 description="Trigger testing for Claude skills.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -259,7 +392,15 @@ def main() -> None:
     run_p.add_argument("spec", type=Path)
     run_p.add_argument("--runs", type=int, default=None,
                        help="override runs_per_prompt (use 3 for quick local checks)")
-    run_p.add_argument("--json", action="store_true")
+    run_p.add_argument("--model", default=None, help="override settings.model")
+    run_p.add_argument("--json", action="store_true", help="machine-readable report")
+    run_p.add_argument("--save", type=Path, metavar="FILE",
+                       help="write this run's results as a baseline JSON file")
+    run_p.add_argument("--compare", type=Path, metavar="FILE",
+                       help="show trigger-rate deltas against a saved baseline")
+    run_p.add_argument("--fail-on-regression", action="store_true",
+                       help="with --compare: exit 1 if any prompt's rate moved the wrong "
+                            "way by 20%% or more, even if it still passes its threshold")
 
     cor_p = sub.add_parser("corpus", help="auto-test every skill in a directory")
     cor_p.add_argument("skills_dir", type=Path)
@@ -270,10 +411,16 @@ def main() -> None:
     sug_p.add_argument("skill")
     sug_p.add_argument("--skills-dir", type=Path, default=Path("./skills"))
     sug_p.add_argument("--model", default=DEFAULT_MODEL)
+    return p
 
-    a = p.parse_args()
+
+def main(argv: list[str] | None = None) -> None:
+    a = build_parser().parse_args(argv)
     if a.cmd == "run":
-        sys.exit(run_suite(a.spec, a.runs, a.json))
+        if a.fail_on_regression and not a.compare:
+            sys.exit("misfire: --fail-on-regression requires --compare")
+        sys.exit(run_suite(a.spec, a.runs, a.json, a.model,
+                           a.save, a.compare, a.fail_on_regression))
     elif a.cmd == "corpus":
         sys.exit(run_corpus(a.skills_dir, a.runs, a.model))
     elif a.cmd == "suggest":
