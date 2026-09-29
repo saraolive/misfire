@@ -8,7 +8,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install requests pyyaml
-      - run: python misfire.py run skill-tests.yaml --json > misfire-report.json
+      - run: python misfire.py run examples/skill-tests.yaml --json > misfire-report.json
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       - uses: actions/upload-artifact@v4
